@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>飯屋ファインダー</title>
+    <link rel="stylesheet" href="css/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🍜%3C/text%3E%3C/svg%3E">
+</head>
+  <body>
+    <header class="site-header">
+      <h1>飯屋ファインダー</h1>
+      <p class="tagline">地名・駅名とキーワードで、周辺の飲食店を探す（OpenStreetMap ベース）</p>
+    </header>
+
+    <main>
+      <form id="search-form" class="search-form" autocomplete="off">
+        <div class="field">
+          <label for="place">場所（地名・駅名）</label>
+          <div class="place-row">
+            <input
+              type="text"
+              id="place"
+              name="place"
+              placeholder="例: 博多駅、渋谷、京都市役所"
+            />
+            <button type="button" id="use-location" class="secondary">現在地を使う</button>
+          </div>
+          <p id="geo-status" class="hint" aria-live="polite"></p>
+        </div>
+
+        <div class="field">
+          <label for="keyword">キーワード</label>
+          <input
+            type="text"
+            id="keyword"
+            name="keyword"
+            placeholder="例: ラーメン、寿司、居酒屋"
+          />
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="radius">最大距離</label>
+            <select id="radius" name="radius">
+              <option value="500">500m</option>
+              <option value="1000" selected>1km</option>
+              <option value="3000">3km</option>
+              <option value="5000">5km</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="sort">並び順</label>
+            <select id="sort" name="sort">
+              <option value="distance" selected>距離順</option>
+              <option value="name">名前順</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="openNow" name="openNow" />
+            営業中のみ
+          </label>
+          <label class="check">
+            <input type="checkbox" id="excludeUnknown" name="excludeUnknown" />
+            営業時間不明を除外
+          </label>
+        </div>
+
+        <button type="submit" id="submit-btn" class="primary">検索</button>
+      </form>
+
+      <section id="status-area" aria-live="polite">
+        <div id="loading" class="loading" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="loading-text">検索中…</span>
+        </div>
+        <div id="error-box" class="error-box" hidden>
+          <p id="error-message"></p>
+          <details id="error-details" hidden>
+            <summary>詳細（各ミラーの結果）</summary>
+            <ul id="error-attempts" class="error-attempts"></ul>
+          </details>
+          <button type="button" id="retry-btn" class="secondary">再試行</button>
+        </div>
+        <p id="count-line" class="count-line" hidden></p>
+      </section>
+
+      <section id="results" class="results" aria-live="polite"></section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        地図データ ©
+        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener"
+          >OpenStreetMap contributors (ODbL)</a
+        >
+      </p>
+      <p class="footer-note">検索: Nominatim / Overpass API</p>
+    </footer>
+
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>
