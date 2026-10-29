@@ -5,10 +5,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:vendor": "esbuild build/vendor-entry.js --bundle --format=esm --minify --legal-comments=none --platform=browser --outfile=vendor/opening_hours.js \"--banner:js=/*! opening_hours.js (incl. i18next, suncalc) — bundled for 飯屋ファインダー. opening_hours.js is licensed under LGPL-3.0-only (see https://github.com/opening-hours/opening_hours.js). */\""
+    "build:vendor:oh": "esbuild build/vendor-entry.js --bundle --format=esm --minify --legal-comments=none --platform=browser --outfile=vendor/opening_hours.js \"--banner:js=/*! opening_hours.js (incl. i18next, suncalc) — bundled for 飯屋ファインダー. opening_hours.js is licensed under LGPL-3.0-only (see https://github.com/opening-hours/opening_hours.js). */\"",
+    "build:vendor:vt": "esbuild build/vector-tile-entry.js --bundle --format=esm --minify --legal-comments=none --platform=browser --outfile=vendor/vector-tile.js \"--banner:js=/*! @mapbox/vector-tile + pbf — bundled for 飯屋ファインダー. Both BSD-3-Clause (see vendor/licenses/). */\"",
+    "build:vendor": "npm run build:vendor:oh && npm run build:vendor:vt"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",
-    "opening_hours": "^3.8.0"
+    "opening_hours": "^3.8.0",
+    "@mapbox/vector-tile": "^2.0.5",
+    "pbf": "^4.0.2"
   }
 }

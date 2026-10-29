@@ -33,9 +33,10 @@
 - **外部 API 利用マナー**
   - **Nominatim**: 独自ヘッダを付けず Referer による識別に任せる（ブラウザは UA を設定できない）。**1 秒 1 リクエスト以下**にクライアント側でスロットリング（直列化＋間隔 1,100ms 以上、直近リクエスト時刻を `localStorage` に保存しリロード直後の連打も防止）。結果を `localStorage`（`mf:geo:`）に 24 時間キャッシュ（ヒットなしは 1 時間）。**最大 1 req/s・重い利用は不可、個人・非商用**という利用方針に従う。
   - **Overpass**: GET + `?data=` の単純リクエスト。同一条件（lat/lng を小数 4 桁に丸め＋radius をキー）の結果を `sessionStorage`（`mf:ovp:`）に約 10 分キャッシュ。容量超過時は `mf:ovp:` エントリを掃除して再試行（try/catch で保護）。
-  - **Overpass 耐障害性**: ミラーを順にフォールバック（`overpass-api.de`（15s）→ `overpass.private.coffee`（15s）→ `maps.mail.ru`（45s））。AbortController タイムアウト／ネットワークエラー／429／406／5xx／非 JSON 時は短いバックオフ（1s → 2s）後に次のミラーへ。**並列リクエストはしない**。直近 30 秒以内に 429/406 を返したミラーは `sessionStorage` の記録に基づき次へスキップ。開発時のみ `js/osm.js` の定数 `OVERPASS_OVERRIDE` で上書き可（公開サイトで任意 URL を指定されないよう、URL パラメータでの上書きは受け付けない）。
+  - **Overpass 耐障害性（ヘッジ要求）**: `overpass-api.de` → 2.5 秒で `overpass.private.coffee` → 2.5 秒で `maps.mail.ru` をずらして起動し、最初の成功を採用・残りは AbortController で中断（各 25 秒、全体 28 秒）。1 ミラーへの同時要求は 1 本。即時の 502/503/504 は 2 秒後に 1 回だけ再試行。直近 30 秒以内に 429/406 のミラーはスキップ、直近 2 分以内に timeout/5xx のミラーは後回し。クエリは半径内の飲食 amenity を 1 回だけ空間検索し、キーワードは cuisine / 店名でサーバー側絞り込み（`[timeout:20][maxsize:32MB]`、`out center qt`）。開発時のみ `js/osm.js` の定数 `OVERPASS_OVERRIDE` で上書き可（URL パラメータでの上書きは受け付けない）。
+  - **簡易検索フォールバック（キー不要）**: Overpass が 5 秒以内に返らなければ OpenFreeMap ベクタータイル（z14 `poi` レイヤ、ACAO *）と Nominatim（viewbox + bounded、1 秒 1 リクエスト以下）で並行検索し、先に出た結果を暫定表示。Overpass 成功で置き換え、全滅時は簡易検索結果を「簡易検索の結果」注記付きで表示（店名ベースのため漏れあり・営業時間が欠ける場合あり）。
   - **メインインスタンスは混雑**しており、低頻度利用・キャッシュ・429/406 後の待機が求められている旨に従う。短時間の大量検索は避ける。
-  - 全ミラー失敗時は分かりやすい日本語エラーと「再試行」ボタンを表示し、同じ条件で再検索できる。各ミラーの試行結果（host + status / timeout）を `<details>` に表示。
+  - Overpass・簡易検索とも失敗した場合は分かりやすい日本語エラーと「再試行」ボタンを表示し、同じ条件で再検索できる。各ミラーの試行結果（host + status / timeout）を `<details>` に表示。
 - **進捗表示**: 検索中はどのミラーを試行中かを示すテキスト（例: 「地図データを取得中…（overpass-api.de）」）を表示。
 - **UI**: 日本語、スマホ対応（幅 360〜390px で横スクロールが出ないよう長い URL・住所・営業時間を `overflow-wrap:anywhere` で折り返し、入力は `width:100%` + `box-sizing:border-box`、`flex-wrap` を使用。`<meta name="viewport">` 設定）。HTML エスケープ徹底。`[hidden]{display:none !important}`。
 - **データの限界**: OSM には評価・レビュー数・価格帯が無く、営業時間や住所の登録率も店舗によりばらつく旨を README に明記。

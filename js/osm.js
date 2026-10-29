@@ -8,10 +8,12 @@
 //    （独自ヘッダを付けない＝ CORS プリフライトを避ける）。
 //  - Nominatim は 1 秒 1 リクエスト以下に直列スロットリングし、結果を
 //    localStorage にキャッシュ（24h / 失敗は 1h）。
-//  - Overpass は複数ミラーへ順にフォールバック（GET + ?data= でプリフライト回避）。
+//  - Overpass は複数ミラーへヘッジ要求（GET + ?data= でプリフライト回避）。
+//    遅い・全滅時は OpenFreeMap タイル / Nominatim のキー不要検索へフォールバック。
 // ---------------------------------------------------------------------------
 
 import opening_hours from '../vendor/opening_hours.js';
+import { VectorTile, Pbf } from '../vendor/vector-tile.js';
 
 // ---------------------------------------------------------------------------
 // 設定
@@ -30,20 +32,38 @@ const GEO_PREFIX = 'mf:geo:';
 const GEO_TTL_MS = 24 * 60 * 60 * 1000; // 24 時間（ヒット）
 const GEO_NEG_TTL_MS = 60 * 60 * 1000; // 1 時間（ヒットなし）
 
-// 既定の Overpass ミラー（順にフォールバック）。timeout は AbortController 用。
+// Overpass ミラー（運営者が異なる 3 系統）。順に「ずらして」起動するヘッジ要求で、
+// 最初に成功した応答を採用し残りは AbortController で中断する。
+//  - overpass-api.de        : FOSSGIS 本家（混雑時 504/timeout が多い）
+//  - overpass.private.coffee: 旧 overpass.kumi.systems
+//  - maps.mail.ru           : VK Maps（ACAO * を確認済み）
+// z./lz4.overpass-api.de は本家と同じ運営・同じ負荷なので重複させない。
 const DEFAULT_OVERPASS_MIRRORS = [
-  { url: 'https://overpass-api.de/api/interpreter', timeout: 15000 },
-  { url: 'https://overpass.private.coffee/api/interpreter', timeout: 15000 },
-  { url: 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', timeout: 45000 },
+  { url: 'https://overpass-api.de/api/interpreter', timeout: 25000 },
+  { url: 'https://overpass.private.coffee/api/interpreter', timeout: 25000 },
+  { url: 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', timeout: 25000 },
 ];
 // テスト用に JS 定数でも上書き可（カンマ区切りの http(s) URL）。
 const OVERPASS_OVERRIDE = '';
 
-const OVERPASS_BACKOFFS = [1000, 2000]; // ミラー切替前の待機
+const OVERPASS_HEDGE_DELAY_MS = 2500; // 応答が無ければ次のミラーを起動するまでの間隔
+const OVERPASS_DEADLINE_MS = 28 * 1000; // Overpass 全体の打ち切り
+const FALLBACK_START_MS = 5000; // Overpass が遅いとき、キー不要の簡易検索を先行起動するまでの時間
 const OVERPASS_CACHE_PREFIX = 'mf:ovp:';
 const OVERPASS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 分
 const OVERPASS_FAIL_PREFIX = 'mf:ovpfail:'; // ミラーごとの直近 429/406 時刻
 const OVERPASS_FAIL_SKIP_MS = 30 * 1000; // 直近 30 秒以内に 429/406 を返したミラーは飛ばす
+const OVERPASS_BAD_PREFIX = 'mf:ovpbad:'; // 直近の timeout/5xx 時刻（順番を後ろへ回す）
+const OVERPASS_BAD_DEMOTE_MS = 2 * 60 * 1000;
+
+// フォールバック用: OpenFreeMap のベクタータイル（キー不要・ACAO *・版付き URL で長期キャッシュ）
+const OFM_TILEJSON_URL = 'https://tiles.openfreemap.org/planet';
+const OFM_TEMPLATE_KEY = 'mf:ofm:tpl';
+const OFM_TEMPLATE_TTL_MS = 12 * 60 * 60 * 1000;
+const TILE_Z = 14; // OpenMapTiles の poi レイヤは z14 で全件入る
+const TILE_MAX = 36;
+const TILE_CONCURRENCY = 6;
+const TILE_TIMEOUT_MS = 12 * 1000;
 
 // ---------------------------------------------------------------------------
 // 汎用ユーティリティ
@@ -196,27 +216,55 @@ export async function geocode(place) {
 }
 
 // ---------------------------------------------------------------------------
-// Overpass: クエリ・フォールバック・キャッシュ
+// Overpass: クエリ・ヘッジ要求・キャッシュ
 // ---------------------------------------------------------------------------
-function overpassCacheKey(lat, lng, radius) {
-  return `${OVERPASS_CACHE_PREFIX}${lat.toFixed(4)},${lng.toFixed(4)},${radius}`;
+const AMENITY_RE = AMENITY_VALUES.join('|');
+
+function filterSignature(resolved) {
+  if (!resolved) return '*';
+  return [resolved.cuisines.join('|'), resolved.amenities.join('|'), resolved.names.join('|')].join('/');
 }
 
-export function buildOverpassQuery(lat, lng, radius) {
-  // amenity を持つ node/way を先に半径で絞り、その中から対象 amenity を選ぶ（正規表現を全体に掛けるより軽い）
-  const re = AMENITY_VALUES.join('|');
-  const around = `around:${radius},${lat},${lng}`;
-  return (
-    `[out:json][timeout:25];\n` +
-    `node(${around})[amenity]->.n;\n` +
-    `way(${around})[amenity]->.w;\n` +
-    `(node.n["amenity"~"^(${re})$"];way.w["amenity"~"^(${re})$"];);\n` +
-    `out center;`
-  );
+function overpassCacheKey(lat, lng, radius, resolved, source = 'ovp') {
+  return `${OVERPASS_CACHE_PREFIX}${source}:${lat.toFixed(4)},${lng.toFixed(4)},${radius}:${filterSignature(resolved)}`;
+}
+
+// Overpass 正規表現（POSIX ERE）と QL 文字列の両方に安全な形へエスケープ
+function qlRegexLiteral(str) {
+  const re = String(str).replace(/[.^$*+?()[\]{}|\\]/g, '\\$&');
+  return re.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, ' ');
+}
+
+/**
+ * 軽量クエリ: 半径内の飲食 amenity を 1 回だけ空間検索し、キーワードがあれば
+ * cuisine / 店名 / 追加 amenity でサーバー側で絞り込む（返すデータ量を最小化）。
+ */
+export function buildOverpassQuery(lat, lng, radius, resolved) {
+  const head = `[out:json][timeout:20][maxsize:33554432];\n`;
+  const base = `nwr(around:${radius},${lat.toFixed(6)},${lng.toFixed(6)})["amenity"~"^(${AMENITY_RE})$"]`;
+  if (!resolved) return head + base + ';\nout center qt;';
+
+  const parts = [];
+  if (resolved.cuisines.length) {
+    const cs = resolved.cuisines.map(qlRegexLiteral).join('|');
+    parts.push(
+      resolved.mapped
+        ? `nwr.a["cuisine"~"(^|;) *(${cs}) *(;|$)",i];`
+        : `nwr.a["cuisine"~"${cs}",i];`
+    );
+  }
+  for (const n of resolved.names) {
+    const lit = qlRegexLiteral(n);
+    parts.push(`nwr.a["name"~"${lit}",i];`, `nwr.a["name:ja"~"${lit}",i];`, `nwr.a["name:en"~"${lit}",i];`);
+  }
+  if (resolved.amenities.length) {
+    parts.push(`nwr.a["amenity"~"^(${resolved.amenities.map(qlRegexLiteral).join('|')})$"];`);
+  }
+  return head + base + '->.a;\n(' + parts.join('') + ');\nout center qt;';
 }
 
 function readOverpassCache(key) {
-  const raw = ssGet(key) || lsGet(key);
+  const raw = ssGet(key);
   if (!raw) return null;
   try {
     const cached = JSON.parse(raw);
@@ -257,86 +305,368 @@ function evictOverpassCache() {
   }
 }
 
-// 直近 30 秒以内に 429/406 を返したミラーか？
-function mirrorRecentlyFailed(url) {
-  const ts = parseInt(ssGet(OVERPASS_FAIL_PREFIX + hostOf(url)) || '0', 10) || 0;
-  return ts > 0 && Date.now() - ts < OVERPASS_FAIL_SKIP_MS;
+function stampAge(prefix, url) {
+  const ts = parseInt(ssGet(prefix + hostOf(url)) || '0', 10) || 0;
+  return ts > 0 ? Date.now() - ts : Infinity;
 }
-function markMirrorFailed(url) {
-  ssSet(OVERPASS_FAIL_PREFIX + hostOf(url), String(Date.now()));
-}
+const mirrorRecentlyFailed = (url) => stampAge(OVERPASS_FAIL_PREFIX, url) < OVERPASS_FAIL_SKIP_MS;
+const mirrorRecentlyBad = (url) => stampAge(OVERPASS_BAD_PREFIX, url) < OVERPASS_BAD_DEMOTE_MS;
+const markMirrorFailed = (url) => ssSet(OVERPASS_FAIL_PREFIX + hostOf(url), String(Date.now()));
+const markMirrorBad = (url) => ssSet(OVERPASS_BAD_PREFIX + hostOf(url), String(Date.now()));
+const clearMirrorBad = (url) => ssSet(OVERPASS_BAD_PREFIX + hostOf(url), '0');
 
 /**
- * Overpass へクエリを投げ、失敗時は次のミラーへフォールバックする。
- * 並列呼び出しはしない。全滅時は attempts を持つ Error を throw。
- * @param {string} query
- * @param {Array<{url:string,timeout:number}>} mirrors
- * @param {(host:string)=>void} [onProgress] 試行中ミラーの通知
+ * ヘッジ要求: ミラー 1 を起動し、HEDGE_DELAY 以内に成功しなければ次を起動…。
+ * 失敗が確定したら待たずに次を起動。最初の成功を採用し、残りは中断する。
+ * 同一ミラーへの同時要求は 1 本だけ（連打しない）。
+ * @returns {Promise<{elements:Array, host:string, attempts:Array}>}
  */
-async function overpassFetch(query, mirrors, onProgress) {
+function overpassHedged(query, mirrors, { onProgress, signal, deadlineMs = OVERPASS_DEADLINE_MS } = {}) {
   const attempts = [];
-  const data = 'data=' + encodeURIComponent(query);
-  for (let i = 0; i < mirrors.length; i++) {
-    const { url, timeout } = mirrors[i];
-    const host = hostOf(url);
+  // 直近 429/406 のミラーは除外、直近 timeout/5xx のミラーは後ろへ
+  const usable = [];
+  for (const m of mirrors) {
+    if (mirrorRecentlyFailed(m.url)) attempts.push({ host: hostOf(m.url), status: 'skip（直近に 429/406）' });
+    else usable.push(m);
+  }
+  usable.sort((x, y) => (mirrorRecentlyBad(x.url) ? 1 : 0) - (mirrorRecentlyBad(y.url) ? 1 : 0));
 
-    // 直近に 429/406 を返したミラーはスキップ
-    if (mirrorRecentlyFailed(url)) {
-      attempts.push({ host, status: 'skip（直近に 429/406）' });
-      continue;
-    }
+  return new Promise((resolve, reject) => {
+    const controllers = [];
+    const timers = [];
+    let next = 0;
+    let running = 0;
+    let done = false;
+    const data = 'data=' + encodeURIComponent(query);
 
-    if (typeof onProgress === 'function') onProgress(host);
-
-    try {
-      // GET + ?data= （単純リクエスト＝プリフライトなし）。独自ヘッダは付けない。
-      const res = await fetchWithTimeout(url + '?' + data, { method: 'GET' }, timeout);
-      if (res.status === 429 || res.status === 406) {
-        markMirrorFailed(url);
-        attempts.push({ host, status: res.status });
-      } else if (res.status >= 500 || !res.ok) {
-        attempts.push({ host, status: res.status });
-      } else {
-        let json;
-        try {
-          json = await res.json();
-        } catch (e) {
-          attempts.push({ host, error: 'non-JSON' });
-          json = null;
-        }
-        if (json) {
-          return { elements: Array.isArray(json.elements) ? json.elements : [], attempts };
-        }
+    const finish = (ok, value) => {
+      if (done) return;
+      done = true;
+      timers.forEach(clearTimeout);
+      controllers.forEach((c) => c.abort());
+      if (ok) resolve(value);
+      else {
+        const err = new Error('Overpass 全ミラー失敗');
+        err.attempts = attempts;
+        reject(err);
       }
-    } catch (e) {
-      const error = e && e.name === 'AbortError' ? 'timeout' : (e && e.message) || 'network error';
-      attempts.push({ host, error });
-    }
+    };
+    const maybeAllFailed = () => {
+      if (!done && running === 0 && next >= usable.length) finish(false);
+    };
 
-    // 次のミラーがあればバックオフ
-    if (i < mirrors.length - 1) {
-      await sleep(OVERPASS_BACKOFFS[Math.min(i, OVERPASS_BACKOFFS.length - 1)]);
+    const launch = () => {
+      if (done || next >= usable.length) return;
+      const item = usable[next];
+      const wait = (item.notBefore || 0) - Date.now();
+      if (wait > 0) {
+        timers.push(setTimeout(launch, wait));
+        return;
+      }
+      next++;
+      const { url, timeout } = item;
+      const host = hostOf(url);
+      const ctrl = new AbortController();
+      controllers.push(ctrl);
+      running++;
+      if (typeof onProgress === 'function') onProgress(host);
+      let timedOut = false;
+      const t = setTimeout(() => {
+        timedOut = true;
+        ctrl.abort();
+      }, timeout);
+      timers.push(t);
+      // 次ミラーの起動予約（これが成功すれば取り消される）
+      if (next < usable.length) timers.push(setTimeout(launch, OVERPASS_HEDGE_DELAY_MS));
+
+      (async () => {
+        const started = Date.now();
+        try {
+          // GET + ?data= （単純リクエスト＝プリフライトなし）。独自ヘッダは付けない。
+          const res = await fetch(url + '?' + data, { method: 'GET', signal: ctrl.signal });
+          if (res.status === 429 || res.status === 406) {
+            markMirrorFailed(url);
+            throw Object.assign(new Error(String(res.status)), { status: res.status });
+          }
+          if (!res.ok) {
+            markMirrorBad(url);
+            throw Object.assign(new Error(String(res.status)), { status: res.status });
+          }
+          const json = await res.json();
+          // Overpass は過負荷時に 200 + remark（runtime error）で空を返すことがある
+          if (json && json.remark && /runtime error|timed out|out of memory/i.test(json.remark)) {
+            markMirrorBad(url);
+            throw new Error('remark: ' + String(json.remark).slice(0, 80));
+          }
+          clearMirrorBad(url);
+          attempts.push({ host, status: 'OK', ms: Date.now() - started });
+          finish(true, { elements: Array.isArray(json.elements) ? json.elements : [], host, attempts });
+        } catch (e) {
+          if (done) return; // 他ミラーが勝って中断された
+          if (timedOut) markMirrorBad(url);
+          const error = timedOut ? 'timeout' : e && e.status ? undefined : (e && e.message) || 'network error';
+          attempts.push(error ? { host, error } : { host, status: e.status });
+          // 即座に返る 502/503/504（ゲートウェイ混雑）は 1 回だけ間をおいて再試行
+          if (e && e.status >= 502 && e.status <= 504 && !item.retried && Date.now() - started < 5000) {
+            usable.push({ ...item, retried: true, notBefore: Date.now() + 2000 });
+          }
+          running--;
+          launch(); // 失敗が確定したら待たずに次へ
+          maybeAllFailed();
+        } finally {
+          clearTimeout(t);
+        }
+      })();
+    };
+
+    if (usable.length === 0) return finish(false);
+    timers.push(setTimeout(() => finish(false), deadlineMs));
+    if (signal) {
+      if (signal.aborted) return finish(false);
+      signal.addEventListener('abort', () => finish(false), { once: true });
+    }
+    launch();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// キー不要の簡易検索（Overpass が遅い・全滅したときのフォールバック）
+//  - OpenFreeMap ベクタータイル（poi レイヤ）: 半径内の飲食店を店名・種別つきで網羅的に取得し、
+//    店名の部分一致・amenity でクライアント側で絞り込む（cuisine・営業時間は含まれない）
+//  - Nominatim: cuisine 英語名・キーワードで viewbox 内を検索（extratags で cuisine/営業時間も得られる）
+// 結果は Overpass element 互換に変換してマージする。
+// ---------------------------------------------------------------------------
+function viewboxOf(lat, lng, radius) {
+  const dLat = radius / 111320;
+  const dLng = radius / (111320 * Math.cos((lat * Math.PI) / 180));
+  return { west: lng - dLng, east: lng + dLng, south: lat - dLat, north: lat + dLat };
+}
+
+function nominatimTerms(resolved) {
+  if (!resolved) return []; // キーワードなしはタイルだけで十分
+  const terms = [];
+  if (resolved.mapped && resolved.cuisines[0]) terms.push(resolved.cuisines[0]);
+  terms.push(resolved.keyword);
+  return terms.slice(0, 2);
+}
+
+async function nominatimSearch(term, box) {
+  return enqueueNominatim(async () => {
+    const u = new URL(NOMINATIM_URL);
+    u.searchParams.set('format', 'jsonv2');
+    u.searchParams.set('q', term);
+    u.searchParams.set('viewbox', `${box.west},${box.north},${box.east},${box.south}`);
+    u.searchParams.set('bounded', '1');
+    u.searchParams.set('limit', '40');
+    u.searchParams.set('extratags', '1');
+    u.searchParams.set('namedetails', '1');
+    u.searchParams.set('accept-language', 'ja');
+    const res = await fetchWithTimeout(u, {}, NOMINATIM_TIMEOUT_MS);
+    if (!res.ok) throw new Error('Nominatim ' + res.status);
+    const data = await res.json();
+    return (Array.isArray(data) ? data : [])
+      .filter((d) => d.category === 'amenity' && d.osm_type && d.osm_id)
+      .map((d) => ({
+        type: d.osm_type,
+        id: d.osm_id,
+        lat: parseFloat(d.lat),
+        lon: parseFloat(d.lon),
+        tags: {
+          ...(d.extratags || {}),
+          ...(d.namedetails || {}),
+          name: (d.namedetails && d.namedetails.name) || d.name,
+          amenity: d.type,
+        },
+      }));
+  });
+}
+
+async function ofmTileTemplate() {
+  const raw = lsGet(OFM_TEMPLATE_KEY);
+  if (raw) {
+    try {
+      const c = JSON.parse(raw);
+      if (c && Date.now() - c.ts < OFM_TEMPLATE_TTL_MS && /^https:\/\/tiles\.openfreemap\.org\//.test(c.tpl)) return c.tpl;
+    } catch (e) {
+      /* 無視 */
     }
   }
-  const err = new Error('Overpass 全ミラー失敗');
-  err.attempts = attempts;
-  throw err;
+  const res = await fetchWithTimeout(OFM_TILEJSON_URL, {}, TILE_TIMEOUT_MS);
+  if (!res.ok) throw new Error('OpenFreeMap ' + res.status);
+  const tj = await res.json();
+  const tpl = tj && Array.isArray(tj.tiles) && tj.tiles[0];
+  if (!tpl || !/^https:\/\/tiles\.openfreemap\.org\//.test(tpl)) throw new Error('OpenFreeMap tilejson');
+  lsSet(OFM_TEMPLATE_KEY, JSON.stringify({ ts: Date.now(), tpl }));
+  return tpl;
+}
+
+const lon2tile = (lon, z) => Math.floor(((lon + 180) / 360) * 2 ** z);
+const lat2tile = (lat, z) => {
+  const r = (lat * Math.PI) / 180;
+  return Math.floor(((1 - Math.asinh(Math.tan(r)) / Math.PI) / 2) * 2 ** z);
+};
+
+async function tileSearch(box) {
+  const tpl = await ofmTileTemplate();
+  const z = TILE_Z;
+  const x0 = lon2tile(box.west, z);
+  const x1 = lon2tile(box.east, z);
+  const y0 = lat2tile(box.north, z);
+  const y1 = lat2tile(box.south, z);
+  const tiles = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) tiles.push([x, y]);
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  tiles.sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy));
+  tiles.length = Math.min(tiles.length, TILE_MAX);
+
+  const typeOf = { 1: 'node', 2: 'way', 3: 'relation' };
+  const out = [];
+  let ok = 0;
+  let idx = 0;
+  const worker = async () => {
+    while (idx < tiles.length) {
+      const [x, y] = tiles[idx++];
+      try {
+        const url = tpl.replace('{z}', z).replace('{x}', x).replace('{y}', y);
+        const res = await fetchWithTimeout(url, {}, TILE_TIMEOUT_MS);
+        if (!res.ok) continue;
+        const vt = new VectorTile(new Pbf(new Uint8Array(await res.arrayBuffer())));
+        ok++;
+        const layer = vt.layers.poi;
+        if (!layer) continue;
+        for (let i = 0; i < layer.length; i++) {
+          const f = layer.feature(i);
+          const p = f.properties || {};
+          if (!AMENITY_VALUES.includes(p.subclass) || !p.name) continue;
+          const g = f.toGeoJSON(x, y, z).geometry;
+          if (!g || g.type !== 'Point') continue;
+          const fid = Number(f.id);
+          const hasId = Number.isFinite(fid) && fid > 0;
+          out.push({
+            type: (hasId && typeOf[fid % 10]) || 'node',
+            id: hasId ? Math.floor(fid / 10) : `t${x}-${y}-${i}`,
+            lat: g.coordinates[1],
+            lon: g.coordinates[0],
+            tags: {
+              name: p.name,
+              ...(p['name:ja'] ? { 'name:ja': p['name:ja'] } : {}),
+              ...(p['name:en'] ? { 'name:en': p['name:en'] } : {}),
+              amenity: p.subclass,
+            },
+          });
+        }
+      } catch (e) {
+        /* 個別タイルの失敗は無視 */
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(TILE_CONCURRENCY, tiles.length) }, worker));
+  if (!ok) throw new Error('タイル取得失敗');
+  return out;
+}
+
+async function fallbackSearch(lat, lng, radius, resolved, attempts) {
+  const box = viewboxOf(lat, lng, radius);
+  const tasks = [
+    ['tiles.openfreemap.org', () => tileSearch(box)],
+    ...nominatimTerms(resolved).map((t) => ['nominatim.openstreetmap.org', () => nominatimSearch(t, box)]),
+  ];
+  const settled = await Promise.allSettled(tasks.map(([, fn]) => fn()));
+  const byId = new Map();
+  let anyOk = false;
+  settled.forEach((s, i) => {
+    const host = tasks[i][0];
+    if (s.status === 'fulfilled') {
+      anyOk = true;
+      attempts.push({ host, status: `OK（${s.value.length}件）` });
+      for (const el of s.value) {
+        const k = `${el.type}/${el.id}`;
+        const prev = byId.get(k);
+        // タグの多い方（Nominatim: cuisine・営業時間あり）を優先
+        if (!prev || Object.keys(el.tags).length > Object.keys(prev.tags).length) byId.set(k, el);
+      }
+    } else {
+      attempts.push({ host, error: (s.reason && s.reason.message) || 'error' });
+    }
+  });
+  if (!anyOk) {
+    const err = new Error('フォールバック失敗');
+    err.attempts = attempts;
+    throw err;
+  }
+  return Array.from(byId.values()).filter(
+    (el) =>
+      isFinite(el.lat) &&
+      AMENITY_VALUES.includes(String(el.tags.amenity)) &&
+      haversine(lat, lng, el.lat, el.lon) <= radius
+  );
 }
 
 /**
- * 周辺要素を取得する（10 分キャッシュ付き）。
- * @returns {Promise<Array>} Overpass element 配列
+ * 周辺の飲食店要素を取得する。
+ *  1) Overpass ヘッジ要求（最大 OVERPASS_DEADLINE_MS）
+ *  2) FALLBACK_START_MS 経っても Overpass が返らなければ簡易検索を並行起動し、
+ *     先に返れば onPartial で暫定表示。Overpass が成功すれば差し替え。
+ *  3) Overpass が全滅したら簡易検索の結果を返す（source: 'fallback'）。
+ * @returns {Promise<{elements:Array, source:'overpass'|'fallback', attempts:Array}>}
  */
-export async function getOverpassElements(lat, lng, radius, options = {}) {
-  const key = overpassCacheKey(lat, lng, radius);
+export async function getPlaceElements(lat, lng, radius, resolved, options = {}) {
+  const { onProgress, onPartial } = options;
+  const key = overpassCacheKey(lat, lng, radius, resolved);
   const cached = readOverpassCache(key);
-  if (cached) return cached;
+  if (cached) return { elements: cached, source: 'overpass', attempts: [] };
 
   const mirrors = options.mirrors || resolveOverpassMirrors();
-  const query = buildOverpassQuery(lat, lng, radius);
-  const { elements } = await overpassFetch(query, mirrors, options.onProgress);
-  writeOverpassCache(key, elements);
-  return elements;
+  const query = buildOverpassQuery(lat, lng, radius, resolved);
+  const fbKey = overpassCacheKey(lat, lng, radius, resolved, 'fb');
+  const fbAttempts = [];
+  let fallbackPromise = null;
+  const startFallback = () => {
+    if (!fallbackPromise) {
+      const c = readOverpassCache(fbKey);
+      fallbackPromise = c
+        ? Promise.resolve(c)
+        : fallbackSearch(lat, lng, radius, resolved, fbAttempts).then((els) => {
+            writeOverpassCache(fbKey, els);
+            return els;
+          });
+      fallbackPromise.catch(() => {});
+    }
+    return fallbackPromise;
+  };
+
+  let overpassDone = false;
+  const fbTimer = setTimeout(() => {
+    if (overpassDone) return;
+    startFallback().then(
+      (els) => {
+        if (!overpassDone && els.length && typeof onPartial === 'function') onPartial(els);
+      },
+      () => {}
+    );
+  }, FALLBACK_START_MS);
+
+  try {
+    const r = await overpassHedged(query, mirrors, { onProgress });
+    overpassDone = true;
+    writeOverpassCache(key, r.elements);
+    return { elements: r.elements, source: 'overpass', attempts: r.attempts };
+  } catch (e) {
+    overpassDone = true;
+    const attempts = (e && e.attempts) || [];
+    if (typeof onProgress === 'function') onProgress('簡易検索（OpenFreeMap / Nominatim）');
+    try {
+      const els = await startFallback();
+      return { elements: els, source: 'fallback', attempts: attempts.concat(fbAttempts) };
+    } catch (e2) {
+      const err = new Error('全データソース失敗');
+      err.attempts = attempts.concat(fbAttempts);
+      throw err;
+    }
+  } finally {
+    clearTimeout(fbTimer);
+  }
 }
 
 // ---------------------------------------------------------------------------

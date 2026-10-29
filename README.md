@@ -95,15 +95,20 @@ npm run build:vendor
   - 結果は `localStorage`（`mf:geo:`）に 24 時間キャッシュ（ヒットなしは 1 時間）。大量・業務用途には使えません（個人・非商用）。
 - **Overpass API**（店舗検索）
   - 同一条件の結果を `sessionStorage`（`mf:ovp:`）に約 10 分キャッシュ。クエリは **GET + `?data=`**（単純リクエスト）でプリフライトを避けます。
-  - 複数ミラーを順にフォールバック（`overpass-api.de` → `overpass.private.coffee` → `maps.mail.ru`）。タイムアウト／429／406／5xx／非 JSON 時は短いバックオフ（1s → 2s）後に次のミラーへ。**並列リクエストはしません**。
-  - 直近 30 秒以内に 429/406 を返したミラーは次へスキップします（`sessionStorage` で記録）。
+  - 軽量クエリ: 半径内の飲食 amenity を 1 回だけ空間検索し、キーワードがあれば cuisine / 店名 / 追加 amenity で**サーバー側で絞り込み**（`[timeout:20][maxsize:32MB]`、`out center qt`）。
+  - **ヘッジ要求**: `overpass-api.de` → 2.5 秒応答が無ければ `overpass.private.coffee` → さらに 2.5 秒で `maps.mail.ru` を起動し、最初に成功した応答を採用して残りは AbortController で中断します。各要求のタイムアウトは 25 秒、全体は 28 秒で打ち切り。1 ミラーへの同時要求は 1 本だけです。即座に返る 502/503/504 は 2 秒後に 1 回だけ再試行します。
+  - 直近 30 秒以内に 429/406 を返したミラーはスキップ、直近 2 分以内に timeout/5xx だったミラーは順番を後ろへ回します（`sessionStorage` で記録）。
+- **簡易検索（フォールバック、キー不要）**
+  - Overpass が 5 秒以内に返らない場合、並行して [OpenFreeMap](https://openfreemap.org/) のベクタータイル（z14 の `poi` レイヤ）と Nominatim（cuisine 英語名・キーワード、`viewbox` + `bounded`）で検索を始め、先に結果が出れば暫定表示します。Overpass が成功すれば自動で置き換え、Overpass が全滅した場合は簡易検索の結果を注記付きで表示します。
+  - 簡易検索は主に店名・種別で探すため、店名にキーワードを含まないお店（cuisine タグのみ）は漏れることがあり、営業時間も Nominatim で取れたもの以外は「営業時間不明」になります。
   - メインインスタンス（`overpass-api.de`）は混雑しており、**低頻度利用・キャッシュ・429/406 後の待機**が求められています。本アプリはこれに従います。
 
 ## 出典・ライセンス
 
 - 地図データ: © OpenStreetMap contributors（[ODbL](https://www.openstreetmap.org/copyright)）
 - 本アプリのコード: MIT License（`LICENSE` 参照 / Copyright (c) 2026 seike460）
-- 同梱ライブラリ `vendor/opening_hours.js`（opening_hours: LGPL-3.0-only、i18next: MIT、suncalc: BSD-2-Clause）: `vendor/licenses/` 参照
+- 同梱ライブラリ `vendor/opening_hours.js`（opening_hours: LGPL-3.0-only、i18next: MIT、suncalc: BSD-2-Clause）、`vendor/vector-tile.js`（@mapbox/vector-tile・pbf: BSD-3-Clause、@mapbox/point-geometry: ISC）: `vendor/licenses/` 参照
+- フォールバック用タイル: [OpenFreeMap](https://openfreemap.org/)（OpenMapTiles スキーマ、データは © OpenStreetMap contributors）
 - `vendor/opening_hours.js`: [opening_hours.js](https://github.com/opening-hours/opening_hours.js)（LGPL-3.0）をバンドルしたもの
 
 ## ファイル構成
@@ -118,10 +123,12 @@ meshiya-finder-static/
 │   ├── osm.js           Nominatim / Overpass 呼び出し・キャッシュ・結果整形（ESM）
 │   └── app.js           UI・検索フロー・描画・現在地・エラー処理（ESM エントリ）
 ├── vendor/
-│   └── opening_hours.js opening_hours.js をバンドルした ES モジュール（CDN 不使用）
+│   ├── opening_hours.js opening_hours.js をバンドルした ES モジュール（CDN 不使用）
+│   └── vector-tile.js   ベクタータイル（MVT）デコーダ（フォールバック検索用）
 ├── build/
-│   └── vendor-entry.js  build:vendor の esbuild エントリ
-├── package.json         devDependencies（esbuild / opening_hours）と build:vendor
+│   ├── vendor-entry.js  build:vendor:oh の esbuild エントリ
+│   └── vector-tile-entry.js build:vendor:vt の esbuild エントリ
+├── package.json         devDependencies（esbuild / opening_hours / @mapbox/vector-tile / pbf）と build:vendor
 ├── .nojekyll            GitHub Pages で Jekyll 処理を無効化
 ├── README.md
 ├── REQUIREMENTS.md      要件メモ（静的版）

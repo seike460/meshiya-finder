@@ -5,7 +5,7 @@ import {
   ALLOWED_RADII,
   DEFAULT_RADIUS,
   geocode,
-  getOverpassElements,
+  getPlaceElements,
   buildResult,
 } from './osm.js';
 
@@ -29,6 +29,7 @@ const errorDetails = document.getElementById('error-details');
 const errorAttempts = document.getElementById('error-attempts');
 const retryBtn = document.getElementById('retry-btn');
 const countLine = document.getElementById('count-line');
+const sourceNote = document.getElementById('source-note');
 const resultsEl = document.getElementById('results');
 
 let currentCoords = null; // {lat, lng} 現在地を使った場合に保持
@@ -125,6 +126,7 @@ async function runSearch(state) {
   show(errorBox, false);
   show(errorDetails, false);
   show(countLine, false);
+  show(sourceNote, false);
   resultsEl.innerHTML = '';
   loadingText.textContent = '検索中…';
   show(loading, true);
@@ -154,43 +156,51 @@ async function runSearch(state) {
       origin = geo;
     }
 
-    // 2) Overpass で周辺要素を取得（ミラーを順に試す）
-    let elements;
+    // 2) 周辺要素を取得（Overpass ヘッジ要求 → 全滅時はキー不要の簡易検索）
+    const resolved = resolveKeyword(state.keyword);
+    const toResults = (elements) => {
+      let results = [];
+      for (const el of elements) {
+        if (resolved && !elementMatches(el, resolved)) continue;
+        const r = buildResult(el, origin);
+        if (r) results.push(r);
+      }
+      // 営業フィルタ
+      if (state.openNow) results = results.filter((r) => r.openStatus !== 'closed');
+      if (state.excludeUnknown) results = results.filter((r) => r.openStatus !== 'unknown');
+      // 並び順
+      if (state.sort === 'name') {
+        results.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+      } else {
+        results.sort((a, b) => a.distance - b.distance);
+      }
+      return results;
+    };
+
+    let got;
     try {
-      elements = await getOverpassElements(origin.lat, origin.lng, state.radius, {
+      got = await getPlaceElements(origin.lat, origin.lng, state.radius, resolved, {
         onProgress: (host) => {
           loadingText.textContent = `地図データを取得中…（${host}）`;
+        },
+        onPartial: (elements) => {
+          const results = toResults(elements);
+          if (!results.length) return;
+          render({ origin, radius: state.radius, count: results.length, results, source: 'partial' });
+          loadingText.textContent = '簡易検索の結果を表示中。詳しい地図データを引き続き取得しています…';
         },
       });
     } catch (e) {
       showError(
-        'お店の検索に失敗しました（地図データサーバーが混雑しているか応答していません）。時間をおいて「再試行」してください。',
+        'お店の検索に失敗しました（地図データサーバーがすべて混雑しているか応答していません）。少し時間をおいて「再試行」してください。',
         e.attempts
       );
       return;
     }
 
     // 3) キーワード絞り込み・結果整形
-    const resolved = resolveKeyword(state.keyword);
-    let results = [];
-    for (const el of elements) {
-      if (resolved && !elementMatches(el, resolved)) continue;
-      const r = buildResult(el, origin);
-      if (r) results.push(r);
-    }
-
-    // 4) 営業フィルタ
-    if (state.openNow) results = results.filter((r) => r.openStatus !== 'closed');
-    if (state.excludeUnknown) results = results.filter((r) => r.openStatus !== 'unknown');
-
-    // 5) 並び順
-    if (state.sort === 'name') {
-      results.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
-    } else {
-      results.sort((a, b) => a.distance - b.distance);
-    }
-
-    render({ origin, radius: state.radius, count: results.length, results });
+    const results = toResults(got.elements);
+    render({ origin, radius: state.radius, count: results.length, results, source: got.source });
   } catch (e) {
     showError('通信に失敗しました。ネットワークを確認して再試行してください。');
   } finally {
@@ -217,6 +227,7 @@ function showError(message, attempts) {
   }
   show(errorBox, true);
   show(countLine, false);
+  show(sourceNote, false);
   resultsEl.innerHTML = '';
 }
 
@@ -231,6 +242,16 @@ function render(data) {
 
   countLine.textContent = `${data.count || results.length}件見つかりました（中心: ${label}、半径 ${radius}m）`;
   show(countLine, true);
+
+  if (data.source === 'fallback' || data.source === 'partial') {
+    sourceNote.textContent =
+      data.source === 'partial'
+        ? '※ 簡易検索（OpenFreeMap / Nominatim）の暫定結果です。詳しいデータが取れ次第、自動で置き換わります。'
+        : '※ 地図データサーバー（Overpass）が混雑しているため、簡易検索（OpenFreeMap / Nominatim）の結果を表示しています。主に店名で探しているため一部のお店が漏れたり、営業時間が欠けている場合があります。';
+    show(sourceNote, true);
+  } else {
+    show(sourceNote, false);
+  }
 
   if (results.length === 0) {
     resultsEl.innerHTML =
