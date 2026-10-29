@@ -426,3 +426,41 @@ button.secondary:hover {
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+
+/* ページ最下部の広告枠（固定サイズで予約。検索 UI・結果を覆ったりずらしたりしない） */
+.ad-area {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 16px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.ad-box {
+  position: relative;
+  width: 320px;
+  max-width: 100%;
+  height: 100px;
+  overflow: hidden;
+  text-align: center;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px dashed rgba(0, 0, 0, 0.12);
+  border-radius: 4px;
+}
+.ad-label {
+  position: absolute;
+  top: 2px;
+  left: 6px;
+  font-size: 10px;
+  color: #999;
+  pointer-events: none;
+}
+.ad-box .adsbygoogle {
+  position: relative;
+  z-index: 1;
+}
+@media (min-width: 768px) {
+  .ad-box {
+    width: 728px;
+    height: 90px;
+  }
+}
